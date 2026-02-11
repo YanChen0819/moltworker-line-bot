@@ -65,6 +65,39 @@ publicRoutes.get('/_admin/assets/*', async (c) => {
 });
 
 
+// OpenAI-compatible API proxy - /v1/*
+const API_PORT = 18789;
+
+publicRoutes.all('/v1/*', async (c) => {
+  const sandbox = c.get('sandbox');
+  const { ensureMoltbotGateway } = await import('../gateway');
+  
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+  } catch (error) {
+    console.error('[API] Failed to start gateway:', error);
+    return c.json({ error: 'Gateway not available' }, 503);
+  }
+
+  const url = new URL(c.req.url);
+  const method = c.req.method;
+  const isGetOrHead = method === 'GET' || method === 'HEAD';
+  
+  const rewrittenReq = new Request(url.toString(), {
+    method,
+    headers: c.req.raw.headers,
+    body: isGetOrHead ? null : await c.req.raw.clone().blob(),
+  });
+  
+  const httpResponse = await sandbox.containerFetch(rewrittenReq, API_PORT);
+  
+  return new Response(httpResponse.body, {
+    status: httpResponse.status,
+    statusText: httpResponse.statusText,
+    headers: httpResponse.headers,
+  });
+});
+
 // POST /webhooks/* - Webhook endpoints (LINE, Telegram, etc.)
 publicRoutes.all('/webhooks/*', async (c) => {
   // === Capture EVERYTHING first ===
