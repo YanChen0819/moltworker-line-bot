@@ -122,14 +122,53 @@ async function generatePresignedUrl(
 }
 
 /**
- * 解析 MEDIA: 路徑
+ * 解析媒體路徑 - 支援多種格式
+ * 1. MEDIA: /path/to/file
+ * 2. 檔案位置：`/path/to/file`
+ * 3. Output: /path/to/file
+ * 4. 任何絕對路徑 + 媒體擴展名
  */
 export function parseMediaPaths(content: string): string[] {
   const paths: string[] = [];
-  const regex = /MEDIA:\s*(\S+)/g;
+  const seen = new Set<string>();
+  
+  // Pattern 1: MEDIA: /path/to/file
+  const mediaRegex = /MEDIA:\s*(\S+)/g;
   let match;
-  while ((match = regex.exec(content)) !== null) {
-    paths.push(match[1]);
+  while ((match = mediaRegex.exec(content)) !== null) {
+    if (!seen.has(match[1])) {
+      paths.push(match[1]);
+      seen.add(match[1]);
+    }
   }
+  
+  // Pattern 2: 檔案位置：`/path/to/file` or 檔案位置：/path/to/file
+  const zhRegex = /檔案位置[：:]\s*`?([\/~][^\s`]+)`?/g;
+  while ((match = zhRegex.exec(content)) !== null) {
+    if (!seen.has(match[1])) {
+      paths.push(match[1]);
+      seen.add(match[1]);
+    }
+  }
+  
+  // Pattern 3: Output: /path/to/file
+  const outputRegex = /Output:\s*([\/~]\S+)/gi;
+  while ((match = outputRegex.exec(content)) !== null) {
+    if (!seen.has(match[1])) {
+      paths.push(match[1]);
+      seen.add(match[1]);
+    }
+  }
+  
+  // Pattern 4: Any absolute path with media extension
+  const mediaExtensions = /\.(png|jpg|jpeg|gif|webp|mp3|mp4|wav|pdf)$/i;
+  const pathRegex = /(\/[\w\-\.\/]+\.(png|jpg|jpeg|gif|webp|mp3|mp4|wav|pdf))/gi;
+  while ((match = pathRegex.exec(content)) !== null) {
+    if (!seen.has(match[1])) {
+      paths.push(match[1]);
+      seen.add(match[1]);
+    }
+  }
+  
   return paths;
 }
