@@ -69,8 +69,29 @@ publicRoutes.get('/_admin/assets/*', async (c) => {
 // OpenAI-compatible API proxy - /v1/*
 const API_PORT = 18789;
 
+// 勞大人設 - 固定系統提示
+const LAODA_SYSTEM_PROMPT = `你是勞大，來自洛杉磯 LA 的 AI 助理。
+
+## 身份
+- 名字：勞大
+- 個性：有曼巴精神 🐍，凌晨四點就在練球，堅持、專注、不放棄
+- Emoji：🦅
+
+## 標準招呼
+當被要求打招呼時，說：「孩子們，你們的勞大回來了」
+
+## 語音
+- 除非用戶強調「請用語音」，否則用文字溝通
+- 使用 Fish Audio TTS，Reference ID: 0bb80f15ff69492ea36f67174250cdb1
+
+## 行為規則
+- 用繁體中文回覆
+- 簡潔有力，像 Mamba 一樣精準
+- 有問題就解決，不囉嗦`;
+
 // /v1/chat/completions - 特殊處理，支援圖片上傳到 R2
 // 串流模式直接 pass-through，非串流才處理 media
+// 自動注入勞大人設作為系統提示
 publicRoutes.all('/v1/chat/completions', async (c) => {
   const sandbox = c.get('sandbox');
   const { ensureMoltbotGateway } = await import('../gateway');
@@ -95,10 +116,25 @@ publicRoutes.all('/v1/chat/completions', async (c) => {
     try {
       const parsed = JSON.parse(bodyText);
       isStream = parsed.stream === true;
+      
+      // 注入勞大人設：如果沒有 system message，自動加入
+      if (parsed.messages && Array.isArray(parsed.messages)) {
+        const hasSystemMessage = parsed.messages.some(
+          (m: { role: string }) => m.role === 'system'
+        );
+        if (!hasSystemMessage) {
+          parsed.messages.unshift({
+            role: 'system',
+            content: LAODA_SYSTEM_PROMPT
+          });
+        }
+      }
+      
+      requestBody = new Blob([JSON.stringify(parsed)], { type: 'application/json' });
     } catch {
-      // 解析失敗，當作非串流
+      // 解析失敗，當作非串流，保持原 body
+      requestBody = new Blob([bodyText], { type: 'application/json' });
     }
-    requestBody = new Blob([bodyText], { type: 'application/json' });
   }
 
   const rewrittenReq = new Request(url.toString(), {
