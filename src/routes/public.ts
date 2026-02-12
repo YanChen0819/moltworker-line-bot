@@ -70,6 +70,7 @@ publicRoutes.get('/_admin/assets/*', async (c) => {
 const API_PORT = 18789;
 
 // /v1/chat/completions - 特殊處理，支援圖片上傳到 R2
+// 串流模式直接 pass-through，非串流才處理 media
 publicRoutes.all('/v1/chat/completions', async (c) => {
   const sandbox = c.get('sandbox');
   const { ensureMoltbotGateway } = await import('../gateway');
@@ -85,13 +86,39 @@ publicRoutes.all('/v1/chat/completions', async (c) => {
   const method = c.req.method;
   const isGetOrHead = method === 'GET' || method === 'HEAD';
 
+  // 檢查是否為串流請求
+  let isStream = false;
+  let requestBody: Blob | null = null;
+
+  if (!isGetOrHead) {
+    const bodyText = await c.req.text();
+    try {
+      const parsed = JSON.parse(bodyText);
+      isStream = parsed.stream === true;
+    } catch {
+      // 解析失敗，當作非串流
+    }
+    requestBody = new Blob([bodyText], { type: 'application/json' });
+  }
+
   const rewrittenReq = new Request(url.toString(), {
     method,
     headers: c.req.raw.headers,
-    body: isGetOrHead ? null : await c.req.raw.clone().blob(),
+    body: requestBody,
   });
 
   const httpResponse = await sandbox.containerFetch(rewrittenReq, API_PORT);
+
+  // 串流模式：直接 pass-through，不處理 media
+  if (isStream) {
+    return new Response(httpResponse.body, {
+      status: httpResponse.status,
+      statusText: httpResponse.statusText,
+      headers: httpResponse.headers,
+    });
+  }
+
+  // 非串流模式：處理 MEDIA paths
   const responseText = await httpResponse.text();
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
