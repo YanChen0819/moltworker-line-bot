@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { MOLTBOT_PORT } from '../config';
 import { findExistingMoltbotProcess } from '../gateway';
+import { uploadMediaToR2, parseMediaPaths } from '../gateway/media';
 
 /**
  * Public routes - NO Cloudflare Access authentication required
@@ -68,6 +69,81 @@ publicRoutes.get('/_admin/assets/*', async (c) => {
 // OpenAI-compatible API proxy - /v1/*
 const API_PORT = 18789;
 
+// /v1/chat/completions - 特殊處理，支援圖片上傳到 R2
+publicRoutes.all('/v1/chat/completions', async (c) => {
+  const sandbox = c.get('sandbox');
+  const { ensureMoltbotGateway } = await import('../gateway');
+
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+  } catch (error) {
+    console.error('[API] Failed to start gateway:', error);
+    return c.json({ error: 'Gateway not available' }, 503);
+  }
+
+  const url = new URL(c.req.url);
+  const method = c.req.method;
+  const isGetOrHead = method === 'GET' || method === 'HEAD';
+
+  const rewrittenReq = new Request(url.toString(), {
+    method,
+    headers: c.req.raw.headers,
+    body: isGetOrHead ? null : await c.req.raw.clone().blob(),
+  });
+
+  const httpResponse = await sandbox.containerFetch(rewrittenReq, API_PORT);
+  const responseText = await httpResponse.text();
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let data: any;
+  try {
+    data = JSON.parse(responseText);
+  } catch {
+    // 不是 JSON，直接返回
+    return new Response(responseText, {
+      status: httpResponse.status,
+      headers: httpResponse.headers,
+    });
+  }
+
+  // 檢查並處理 MEDIA: paths
+  const content = data.choices?.[0]?.message?.content;
+  if (content && typeof content === 'string') {
+    const mediaPaths = parseMediaPaths(content);
+
+    if (mediaPaths.length > 0) {
+      const mediaItems: Array<{ type: string; url: string }> = [];
+      let newContent = content;
+
+      for (const filePath of mediaPaths) {
+        const result = await uploadMediaToR2(sandbox, c.env, filePath);
+        if (result) {
+          const ext = filePath.split('.').pop()?.toLowerCase() || '';
+          const type = ['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)
+            ? 'image'
+            : ['mp3', 'wav', 'mp4'].includes(ext)
+              ? 'audio'
+              : 'file';
+
+          mediaItems.push({ type, url: result.url });
+          newContent = newContent.replace(
+            new RegExp(`MEDIA:\\s*${filePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n?`),
+            ''
+          );
+        }
+      }
+
+      data.choices[0].message.content = newContent.trim();
+      if (mediaItems.length > 0) {
+        data.choices[0].message.media = mediaItems;
+      }
+    }
+  }
+
+  return c.json(data, httpResponse.status as 200);
+});
+
+// /v1/* 其他 endpoints - 直接 proxy
 publicRoutes.all('/v1/*', async (c) => {
   const sandbox = c.get('sandbox');
   const { ensureMoltbotGateway } = await import('../gateway');
