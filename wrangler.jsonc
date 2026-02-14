@@ -68,6 +68,7 @@
 		{
 			"binding": "MOLTBOT_BUCKET",
 			"bucket_name": "moltbot-data",
+			"mount_path": "/clawdbot_re/"
 		},
 	],
 	// Cron trigger to sync moltbot data to R2 every 5 minutes
