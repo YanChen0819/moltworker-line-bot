@@ -3,6 +3,7 @@ import type { MoltbotEnv } from '../types';
 import { MOLTBOT_PORT, STARTUP_TIMEOUT_MS } from '../config';
 import { buildEnvVars } from './env';
 import { mountR2Storage } from './r2';
+import { syncFromR2 } from './sync';
 
 /**
  * Find an existing Moltbot gateway process
@@ -48,9 +49,15 @@ export async function findExistingMoltbotProcess(sandbox: Sandbox): Promise<Proc
  * @returns The running gateway process
  */
 export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv): Promise<Process> {
-  // Mount R2 storage for persistent data (non-blocking if not configured)
-  // R2 is used as a backup - the startup script will restore from it on boot
-  await mountR2Storage(sandbox, env);
+  // Mount R2 storage and restore data from backup BEFORE starting the gateway
+  // This ensures config/sessions/skills are available when the gateway starts
+  console.log('[Gateway] Restoring data from R2 backup...');
+  const restoreResult = await syncFromR2(sandbox, env);
+  if (restoreResult.success) {
+    console.log('[Gateway] R2 restore:', restoreResult.details || 'completed', restoreResult.lastSync ? `(lastSync: ${restoreResult.lastSync})` : '');
+  } else {
+    console.log('[Gateway] R2 restore skipped or failed:', restoreResult.error, restoreResult.details || '');
+  }
 
   // Check if Moltbot is already running or starting
   const existingProcess = await findExistingMoltbotProcess(sandbox);
