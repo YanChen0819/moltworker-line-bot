@@ -27,7 +27,7 @@ async function shouldRestoreFromR2(sandbox: Sandbox): Promise<boolean> {
     const r2Time = r2Logs.stdout?.trim();
 
     if (!r2Time) {
-      console.log('[syncFromR2] No R2 sync timestamp found, skipping restore');
+      console.log('[syncFromR2] No R2 sync timestamp found, skipping config restore');
       return false;
     }
 
@@ -50,7 +50,7 @@ async function shouldRestoreFromR2(sandbox: Sandbox): Promise<boolean> {
       console.log('[syncFromR2] R2 backup is newer, will restore');
       return true;
     } else {
-      console.log('[syncFromR2] Local data is newer or same, skipping restore');
+      console.log('[syncFromR2] Local data is newer or same, skipping config restore');
       return false;
     }
   } catch (err) {
@@ -64,8 +64,8 @@ async function shouldRestoreFromR2(sandbox: Sandbox): Promise<boolean> {
  * 
  * This function:
  * 1. Mounts R2 if not already mounted
- * 2. Checks if R2 backup is newer than local data
- * 3. Runs rsync to restore config from R2 (incremental, preserves newer local files)
+ * 2. ALWAYS restores skills (they don't change in container)
+ * 3. Restores config only if R2 backup is newer than local data
  * 
  * @param sandbox - The sandbox instance
  * @param env - Worker environment bindings
@@ -86,67 +86,93 @@ export async function syncFromR2(sandbox: Sandbox, env: MoltbotEnv): Promise<Syn
   // Wait a moment for mount to be fully ready
   await new Promise(r => setTimeout(r, 1000));
 
+  // Create directories if they don't exist
+  await sandbox.startProcess('mkdir -p /root/.clawdbot /root/clawd/skills');
+  await waitForProcess(await sandbox.startProcess('mkdir -p /root/.clawdbot /root/clawd/skills'), 5000);
+
+  // ALWAYS restore skills first (they don't change in container, safe to overwrite)
+  console.log('[syncFromR2] Restoring skills from R2...');
+  try {
+    const skillsCheckProc = await sandbox.startProcess(`test -d ${R2_MOUNT_PATH}/skills && ls -la ${R2_MOUNT_PATH}/skills/ | head -5`);
+    await waitForProcess(skillsCheckProc, 5000);
+    const skillsCheckLogs = await skillsCheckProc.getLogs();
+    console.log('[syncFromR2] R2 skills directory:', skillsCheckLogs.stdout || '(empty or not found)');
+
+    if (skillsCheckLogs.stdout && !skillsCheckLogs.stdout.includes('total 0')) {
+      const skillsCmd = `rsync -r --checksum ${R2_MOUNT_PATH}/skills/ /root/clawd/skills/ 2>&1 && echo "SKILLS_RESTORED"`;
+      const skillsProc = await sandbox.startProcess(skillsCmd);
+      await waitForProcess(skillsProc, 60000);
+      const skillsLogs = await skillsProc.getLogs();
+      console.log('[syncFromR2] Skills restore output:', skillsLogs.stdout?.slice(-300));
+      
+      if (skillsLogs.stdout?.includes('SKILLS_RESTORED')) {
+        console.log('[syncFromR2] Skills restored successfully');
+      } else {
+        console.log('[syncFromR2] Skills restore may have failed:', skillsLogs.stderr);
+      }
+    } else {
+      console.log('[syncFromR2] No skills found in R2, skipping skills restore');
+    }
+  } catch (err) {
+    console.log('[syncFromR2] Error restoring skills:', err);
+  }
+
   // Check if R2 backup exists and has clawdbot.json
+  let hasConfigBackup = false;
   try {
     const checkProc = await sandbox.startProcess(`test -f ${R2_MOUNT_PATH}/clawdbot/clawdbot.json && echo "ok"`);
     await waitForProcess(checkProc, 5000);
     const checkLogs = await checkProc.getLogs();
-    if (!checkLogs.stdout?.includes('ok')) {
-      console.log('[syncFromR2] No backup found in R2, skipping restore');
-      return { success: true, details: 'No backup found in R2' };
-    }
+    hasConfigBackup = checkLogs.stdout?.includes('ok') || false;
   } catch (err) {
-    console.log('[syncFromR2] Error checking R2 backup:', err);
-    return { success: false, error: 'Failed to check R2 backup', details: String(err) };
+    console.log('[syncFromR2] Error checking R2 config backup:', err);
   }
 
-  // Check if we should restore
+  if (!hasConfigBackup) {
+    console.log('[syncFromR2] No config backup found in R2, skills only restored');
+    return { success: true, details: 'Skills restored, no config backup found' };
+  }
+
+  // Check if we should restore config
   const shouldRestore = await shouldRestoreFromR2(sandbox);
   if (!shouldRestore) {
-    return { success: true, details: 'Local data is up to date' };
+    return { success: true, details: 'Skills restored, config is up to date' };
   }
 
-  // Create directories if they don't exist
-  await sandbox.startProcess('mkdir -p /root/.clawdbot /root/clawd/skills');
-
   // Run rsync to restore config from R2 (incremental mode with --update)
-  // --update: skip files that are newer on the receiver (preserves local changes)
-  // --checksum: use checksum instead of mod-time to determine if files differ
   const restoreCmd = `
     rsync -r --update --checksum --exclude='*.lock' --exclude='*.log' --exclude='*.tmp' --exclude='*.sqlite' --exclude='*.sqlite-journal' ${R2_MOUNT_PATH}/clawdbot/ /root/.clawdbot/ 2>&1 && \
-    rsync -r --update --checksum ${R2_MOUNT_PATH}/skills/ /root/clawd/skills/ 2>&1 && \
     cp -f ${R2_MOUNT_PATH}/.last-sync /root/.clawdbot/.last-sync 2>/dev/null || true && \
-    echo "RESTORE_COMPLETE"
+    echo "CONFIG_RESTORE_COMPLETE"
   `;
 
   try {
-    console.log('[syncFromR2] Starting restore from R2...');
+    console.log('[syncFromR2] Restoring config from R2...');
     const proc = await sandbox.startProcess(restoreCmd);
-    await waitForProcess(proc, 60000); // 60 second timeout
+    await waitForProcess(proc, 60000);
 
     const logs = await proc.getLogs();
-    console.log('[syncFromR2] Restore output:', logs.stdout?.slice(-500));
+    console.log('[syncFromR2] Config restore output:', logs.stdout?.slice(-500));
     
-    if (logs.stdout?.includes('RESTORE_COMPLETE')) {
-      // Read the sync timestamp
+    if (logs.stdout?.includes('CONFIG_RESTORE_COMPLETE')) {
       const timestampProc = await sandbox.startProcess('cat /root/.clawdbot/.last-sync 2>/dev/null');
       await waitForProcess(timestampProc, 5000);
       const timestampLogs = await timestampProc.getLogs();
       const lastSync = timestampLogs.stdout?.trim();
 
       console.log('[syncFromR2] Restore completed successfully, lastSync:', lastSync);
-      return { success: true, lastSync, details: 'Restored from R2 backup' };
+      return { success: true, lastSync, details: 'Skills and config restored from R2' };
     } else {
       return {
         success: false,
-        error: 'Restore may have failed',
+        error: 'Config restore may have failed',
         details: logs.stderr || logs.stdout || 'Unknown error',
       };
     }
   } catch (err) {
     return {
       success: false,
-      error: 'Restore error',
+      error: 'Config restore error',
       details: err instanceof Error ? err.message : 'Unknown error',
     };
   }
@@ -178,7 +204,6 @@ export async function syncToR2(sandbox: Sandbox, env: MoltbotEnv): Promise<SyncR
   }
 
   // Sanity check: verify source has critical files before syncing
-  // This prevents accidentally overwriting a good backup with empty/corrupted data
   try {
     const checkProc = await sandbox.startProcess('test -f /root/.clawdbot/clawdbot.json && echo "ok"');
     await waitForProcess(checkProc, 5000);
@@ -187,7 +212,7 @@ export async function syncToR2(sandbox: Sandbox, env: MoltbotEnv): Promise<SyncR
       return { 
         success: false, 
         error: 'Sync aborted: source missing clawdbot.json',
-        details: 'The local config directory is missing critical files. This could indicate corruption or an incomplete setup.',
+        details: 'The local config directory is missing critical files.',
       };
     }
   } catch (err) {
@@ -198,17 +223,13 @@ export async function syncToR2(sandbox: Sandbox, env: MoltbotEnv): Promise<SyncR
     };
   }
 
-  // Run rsync to backup config to R2
-  // Note: Use --no-times because s3fs doesn't support setting timestamps
+  // Run rsync to backup config and skills to R2
   const syncCmd = `rsync -r --no-times --delete --exclude='*.lock' --exclude='*.log' --exclude='*.tmp' /root/.clawdbot/ ${R2_MOUNT_PATH}/clawdbot/ && rsync -r --no-times --delete /root/clawd/skills/ ${R2_MOUNT_PATH}/skills/ && date -Iseconds > ${R2_MOUNT_PATH}/.last-sync`;
   
   try {
     const proc = await sandbox.startProcess(syncCmd);
-    await waitForProcess(proc, 30000); // 30 second timeout for sync
+    await waitForProcess(proc, 30000);
 
-    // Check for success by reading the timestamp file
-    // (process status may not update reliably in sandbox API)
-    // Note: backup structure is ${R2_MOUNT_PATH}/clawdbot/ and ${R2_MOUNT_PATH}/skills/
     const timestampProc = await sandbox.startProcess(`cat ${R2_MOUNT_PATH}/.last-sync`);
     await waitForProcess(timestampProc, 5000);
     const timestampLogs = await timestampProc.getLogs();
