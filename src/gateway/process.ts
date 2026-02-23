@@ -40,8 +40,8 @@ export async function findExistingMoltbotProcess(sandbox: Sandbox): Promise<Proc
  * Ensure the Moltbot gateway is running
  * 
  * This will:
- * 1. Mount R2 storage if configured
- * 2. Check for an existing gateway process
+ * 1. Check for an existing gateway process first (fast path)
+ * 2. Only sync from R2 when starting a NEW gateway
  * 3. Wait for it to be ready, or start a new one
  * 
  * @param sandbox - The sandbox instance
@@ -49,9 +49,31 @@ export async function findExistingMoltbotProcess(sandbox: Sandbox): Promise<Proc
  * @returns The running gateway process
  */
 export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv): Promise<Process> {
-  // Mount R2 storage and restore data from backup BEFORE starting the gateway
-  // This ensures config/sessions/skills are available when the gateway starts
-  console.log('[Gateway] Restoring data from R2 backup...');
+  // FAST PATH: Check if Moltbot is already running first (no R2 sync needed)
+  const existingProcess = await findExistingMoltbotProcess(sandbox);
+  if (existingProcess) {
+    console.log('[Gateway] Found existing process:', existingProcess.id, 'status:', existingProcess.status);
+
+    // Process exists - just wait for port, no need to sync from R2
+    try {
+      console.log('[Gateway] Waiting for port', MOLTBOT_PORT, 'timeout:', STARTUP_TIMEOUT_MS);
+      await existingProcess.waitForPort(MOLTBOT_PORT, { mode: 'tcp', timeout: STARTUP_TIMEOUT_MS });
+      console.log('[Gateway] Gateway is reachable (skipped R2 sync)');
+      return existingProcess;
+    } catch (e) {
+      // Timeout waiting for port - process is likely dead or stuck, kill and restart
+      console.log('[Gateway] Existing process not reachable, killing and restarting...');
+      try {
+        await existingProcess.kill();
+      } catch (killError) {
+        console.log('[Gateway] Failed to kill process:', killError);
+      }
+    }
+  }
+
+  // COLD START: No existing process, need to sync from R2 and start fresh
+  // Only sync when we're actually starting a new gateway
+  console.log('[Gateway] No existing process, restoring data from R2 backup...');
   const restoreResult = await syncFromR2(sandbox, env);
   if (restoreResult.success) {
     console.log('[Gateway] R2 restore:', restoreResult.details || 'completed', restoreResult.lastSync ? `(lastSync: ${restoreResult.lastSync})` : '');
@@ -59,46 +81,22 @@ export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv): P
     console.log('[Gateway] R2 restore skipped or failed:', restoreResult.error, restoreResult.details || '');
   }
 
-  // Check if Moltbot is already running or starting
-  const existingProcess = await findExistingMoltbotProcess(sandbox);
-  if (existingProcess) {
-    console.log('Found existing Moltbot process:', existingProcess.id, 'status:', existingProcess.status);
-
-    // Always use full startup timeout - a process can be "running" but not ready yet
-    // (e.g., just started by another concurrent request). Using a shorter timeout
-    // causes race conditions where we kill processes that are still initializing.
-    try {
-      console.log('Waiting for Moltbot gateway on port', MOLTBOT_PORT, 'timeout:', STARTUP_TIMEOUT_MS);
-      await existingProcess.waitForPort(MOLTBOT_PORT, { mode: 'tcp', timeout: STARTUP_TIMEOUT_MS });
-      console.log('Moltbot gateway is reachable');
-      return existingProcess;
-    } catch (e) {
-      // Timeout waiting for port - process is likely dead or stuck, kill and restart
-      console.log('Existing process not reachable after full timeout, killing and restarting...');
-      try {
-        await existingProcess.kill();
-      } catch (killError) {
-        console.log('Failed to kill process:', killError);
-      }
-    }
-  }
-
   // Start a new Moltbot gateway
-  console.log('Starting new Moltbot gateway...');
+  console.log('[Gateway] Starting new Moltbot gateway...');
   const envVars = buildEnvVars(env);
   const command = '/usr/local/bin/start-moltbot.sh';
 
-  console.log('Starting process with command:', command);
-  console.log('Environment vars being passed:', Object.keys(envVars));
+  console.log('[Gateway] Starting process with command:', command);
+  console.log('[Gateway] Environment vars being passed:', Object.keys(envVars));
 
   let process: Process;
   try {
     process = await sandbox.startProcess(command, {
       env: Object.keys(envVars).length > 0 ? envVars : undefined,
     });
-    console.log('Process started with id:', process.id, 'status:', process.status);
+    console.log('[Gateway] Process started with id:', process.id, 'status:', process.status);
   } catch (startErr) {
-    console.error('Failed to start process:', startErr);
+    console.error('[Gateway] Failed to start process:', startErr);
     throw startErr;
   }
 
